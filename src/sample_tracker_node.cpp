@@ -14,22 +14,27 @@
 #include <assert.h>
 #include <Eigen/Core>
 
-// Tracking Framework
-#include "MTF.h"
+// Modular Tracking Framework
+#include <mtf/mtf.h>
+#include "mtf/Utilities/miscUtils.h"
+
+#include "mtf/Tools/pipeline.h"
+
+typedef std::unique_ptr<mtf::TrackerBase> Tracker_;
 
 int const rate = 30;
 
 cv::Mat display_frame;
-cv::Mat gray_frame;
-cv::Mat rgb_frame;
 std::vector<cv::Point> new_tracker_points;
-std::vector<mtf::TrackerBase*> trackers;
+std::vector<Tracker_> trackers;
+std::vector<PreProc_> pre_procs;
+
 ros::Publisher tracker_pub;
 SharedImageReader *image_reader;
 
 using namespace mtf::params;
 
-typedef struct Patch {
+struct Patch {
     Patch(std::vector<cv::Point> points) {
         assert(points.size() == 4);
         for(unsigned long i = 0; i < points.size(); ++i) {
@@ -38,13 +43,15 @@ typedef struct Patch {
     }
     cv::Point2d operator[](int i) { return corners[i];}
     cv::Point2d corners[4];
-} Patch;
+};
 
 cv::Point get_patch_center(mtf::TrackerBase &tracker) {
-    Eigen::Vector3d tl(tracker.cv_corners[0].x, tracker.cv_corners[0].y, 1);
-    Eigen::Vector3d tr(tracker.cv_corners[1].x, tracker.cv_corners[1].y, 1);
-    Eigen::Vector3d br(tracker.cv_corners[2].x, tracker.cv_corners[2].y, 1);
-    Eigen::Vector3d bl(tracker.cv_corners[3].x, tracker.cv_corners[3].y, 1);
+	cv::Point2d cv_corners[4];
+	mtf::utils::Corners(tracker.getRegion()).points(cv_corners);
+    Eigen::Vector3d tl(cv_corners[0].x, cv_corners[0].y, 1);
+    Eigen::Vector3d tr(cv_corners[1].x, cv_corners[1].y, 1);
+    Eigen::Vector3d br(cv_corners[2].x, cv_corners[2].y, 1);
+    Eigen::Vector3d bl(cv_corners[3].x, cv_corners[3].y, 1);
 
     Eigen::Vector3d center_vec = center_vec = tl.cross(br).cross(tr.cross(bl));
 
@@ -54,29 +61,24 @@ cv::Point get_patch_center(mtf::TrackerBase &tracker) {
     return center;
 }
 
-// TODO: Should we remove the gaussian blur?
-void format_frame() {
-    image_reader->get_next_frame()->convertTo(rgb_frame, rgb_frame.type());
-    cv::cvtColor(rgb_frame, gray_frame, cv::COLOR_RGB2GRAY);
-    cv::GaussianBlur(gray_frame, gray_frame, cv::Size(5, 5), 3);
-}
-
 mtf_bridge::Patch get_tracker_patch(mtf::TrackerBase &tracker) {
+	cv::Point2d cv_corners[4];
+	mtf::utils::Corners(tracker.getRegion()).points(cv_corners);
     mtf_bridge::Point top_left;
-    top_left.x = tracker.cv_corners[0].x;
-    top_left.y = tracker.cv_corners[0].y;
+    top_left.x = cv_corners[0].x;
+    top_left.y = cv_corners[0].y;
 
     mtf_bridge::Point top_right;
-    top_right.x = tracker.cv_corners[1].x;
-    top_right.y = tracker.cv_corners[1].y;
+    top_right.x = cv_corners[1].x;
+    top_right.y = cv_corners[1].y;
 
     mtf_bridge::Point bot_right;
-    bot_right.x = tracker.cv_corners[2].x;
-    bot_right.y = tracker.cv_corners[2].y;
+    bot_right.x = cv_corners[2].x;
+    bot_right.y = cv_corners[2].y;
 
     mtf_bridge::Point bot_left;
-    bot_left.x = tracker.cv_corners[3].x;
-    bot_left.y = tracker.cv_corners[3].y;
+    bot_left.x = cv_corners[3].x;
+    bot_left.y = cv_corners[3].y;
 
     mtf_bridge::Patch patch;
     patch.corners[0] = top_left;
@@ -98,11 +100,15 @@ void update_trackers() {
     if (trackers.empty()) {
         return;
     }
-
-    format_frame();
-
+	//! opdate pre processors
+	for(std::vector<PreProc_>::const_iterator pre_proc = pre_procs.begin();
+		pre_proc != pre_procs.end(); ++pre_proc) {
+		(*pre_proc)->update(*(image_reader->get_next_frame()));
+	}
+	//! opdate trackers
     mtf_bridge::PatchTrackers tracker_msg;
-    for(std::vector<mtf::TrackerBase*>::const_iterator tracker = trackers.begin(); tracker != trackers.end(); ++tracker) {
+    for(std::vector<Tracker_>::const_iterator tracker = trackers.begin(); 
+		tracker != trackers.end(); ++tracker) {
         (*tracker)->update();
         mtf_bridge::Patch tracker_patch = get_tracker_patch(**tracker);
         tracker_msg.trackers.push_back(tracker_patch);
@@ -122,8 +128,11 @@ void draw_frame(std::string cv_window_title) {
 
     // Draw trackers
     if (!trackers.empty()) {
-        for(std::vector<mtf::TrackerBase*>::const_iterator tracker = trackers.begin(); tracker != trackers.end(); ++tracker) {
-            draw_patch((*tracker)->cv_corners, cv::Scalar(0, 0, 255));
+		for(std::vector<Tracker_>::const_iterator tracker = trackers.begin(); 
+			tracker != trackers.end(); ++tracker) {
+			cv::Point2d cv_corners[4];
+			mtf::utils::Corners((*tracker)->getRegion()).points(cv_corners);
+            draw_patch(cv_corners, cv::Scalar(0, 0, 255));
             cv::Point center = get_patch_center(**tracker);
             cv::circle(display_frame, center, 5, cv::Scalar(0, 0, 255), -1);
             // Black outline
@@ -143,7 +152,6 @@ void draw_frame(std::string cv_window_title) {
 
     if (key == 'd') {
         if (trackers.size() > 0) {
-            delete(*trackers.begin());
             trackers.erase(trackers.begin());
         }
     }
@@ -163,13 +171,14 @@ void initialize_tracker() {
     new_tracker_corners.at<double>(0, 3) = new_tracker_points[3].x;
     new_tracker_corners.at<double>(1, 3) = new_tracker_points[3].y;
 
-    mtf::ImgParams *init_params = new mtf::ImgParams(50, 50, gray_frame);
-    mtf::TrackerBase *new_tracker = getTrackerObj(mtf_sm, mtf_am, mtf_ssm, init_params);
+	trackers.push_back(Tracker_(mtf::getTracker(mtf_sm, mtf_am, mtf_ssm, mtf_ilm)));
 
-    format_frame();
-    new_tracker->initialize(new_tracker_corners);
+	pre_procs.push_back(getPreProc(pre_procs, trackers.back()->inputType(), pre_proc_type));
+	pre_procs.back()->initialize(*(image_reader->get_next_frame()));
 
-    trackers.push_back(new_tracker);
+	trackers.back()->setImage(pre_procs.back()->getFrame());
+	trackers.back()->initialize(new_tracker_corners);
+
     ROS_INFO_STREAM("Tracker initialized");
     draw_frame("TrackingNode");
 }
@@ -197,11 +206,8 @@ int main(int argc, char *argv[]) {
     ros::NodeHandle nh_("~");
 
     // Initialize input_obj
-    std::string tracker_params;
-    nh_.param<std::string>("tracker_params", tracker_params, "/cfg/sampel_tracker_params.cfg");
-    std::string params_path = ros::package::getPath("mtf_bridge") + tracker_params;
-    int fargc = readParams((char *)params_path.c_str());
-    parseArgumentPairs(fargv, fargc);
+	config_dir = ros::package::getPath("mtf_bridge") + "/cfg";
+	if(!readParams(argc, argv)){ return EXIT_FAILURE; }
 
     image_reader = new SharedImageReader();
 
@@ -220,11 +226,7 @@ int main(int argc, char *argv[]) {
         ros::Duration(0.7).sleep();
     }
 
-    ROS_INFO_STREAM("Left click to select tracker corners. Right click to reset corners, press 'd' to delet tracker");
-
-    // Initialize frame
-    rgb_frame.create(image_reader->get_height(), image_reader->get_width(), CV_32FC3);
-    gray_frame.create(image_reader->get_height(), image_reader->get_width(), CV_32FC1);
+    ROS_INFO_STREAM("Left click to select tracker corners. Right click to reset corners, press 'd' to delete tracker");
 
 	while(ros::ok()){
 		ros::spinOnce();
